@@ -1,7 +1,5 @@
 #include "main_window.h"
 
-#define SAMPLES_PER_UPDATE 5
-
 static Window *s_window;
 
 static TextLayer *s_text_layer_hand;
@@ -9,15 +7,20 @@ static TextLayer *s_text_layer_info;
 static TextLayer *s_text_layer_data;
 static TextLayer *s_text_layer_battery;
 
-static bool s_sending;
-static int s_send_counter;
+static char* s_data_logging_result_strings[] = {
+  "SUCCESS",
+  "BUSY",
+  "FULL",
+  "NOT FOUND",
+  "CLOSED",
+  "INVALID PARAMS"
+};
 
 static int s_hand_sequence = 0;  // how many of the sequence of keys to change the hand have been pressed?
 static bool s_f_left_hand;
 
-static void update_data_sent() {
+static void update_data_sent(uint16_t data_sent_current) {
   static char data_sent_text[9];
-  uint data_sent_current = get_commlog_data_sent() / 1000;
   static uint data_sent_last = -1;
   if (data_sent_last == data_sent_current)
     return;  // info is up-to-date enough
@@ -27,13 +30,26 @@ static void update_data_sent() {
   text_layer_set_text(s_text_layer_data, data_sent_text);
 }
 
-static void accel_data_handler(AccelData *data, uint32_t num_samples) {
-  if(commlog_send_data(data, num_samples)) {
-    s_send_counter++;
-    update_data_sent();    
+static void show_logging_error(uint16_t logging_result) {
+  if (logging_result > 5) {    // index out of range
+    APP_LOG(APP_LOG_LEVEL_ERROR, "Logging result out of range: %d", logging_result);
+    return;
   }
-  else {
-    text_layer_set_text(s_text_layer_info, "Transmission error!");
+  
+  text_layer_set_text(s_text_layer_info, s_data_logging_result_strings[logging_result]);
+}
+
+static void worker_message_handler(uint16_t type, AppWorkerMessage *message) {
+  switch(type) {
+    case 1:
+      update_data_sent(message->data0);
+      return;
+    case 2:
+      show_logging_error(message->data0);
+      return;
+    default:
+      APP_LOG(APP_LOG_LEVEL_WARNING,"Did not understand worker message type %d", type);
+      return;
   }
 }
 
@@ -49,41 +65,44 @@ static void battery_handler(BatteryChargeState charge_state) {
 }
 
 static void begin_sending_data() {
-  if(s_sending)
+  if(app_worker_is_running())
     return;  // has already begun
 
-  // Begin sending data
-  s_sending = true;
-
-  accel_service_set_sampling_rate(ACCEL_SAMPLING_25HZ);
-  accel_data_service_subscribe(SAMPLES_PER_UPDATE, accel_data_handler);
-
-  text_layer_set_text(s_text_layer_info, "Started");
-
-  commlog_start();
+  AppWorkerResult result = app_worker_launch();
+  
+  if (APP_WORKER_RESULT_SUCCESS == result) {
+    text_layer_set_text(s_text_layer_info, "Started");
+  }
+  else {
+    static char error_message[] =  "Could not start Worker: 999999999";
+    snprintf(error_message, sizeof(error_message), "Could not start Worker: %d", result);        
+    APP_LOG(APP_LOG_LEVEL_ERROR, "Could not start Worker: %d", result);      
+    text_layer_set_text(s_text_layer_info, error_message);
+  }
 }
 
 static void stop_sending_data() {
-  if(!s_sending)
+  if(!app_worker_is_running())
     return;  // does not send currently
 
-  // Stop sending data
-  s_sending = false;
+  AppWorkerResult result = app_worker_kill();
 
-  accel_data_service_unsubscribe();
-
-  text_layer_set_text(s_text_layer_info, "Stopped");
-
-  commlog_stop();
+  if (APP_WORKER_RESULT_SUCCESS == result) {
+    text_layer_set_text(s_text_layer_info, "Stopped");
+  }
+  else {
+    APP_LOG(APP_LOG_LEVEL_WARNING, "Could not stop worker: %d", result);      
+    text_layer_set_text(s_text_layer_info, "Could not stop worker");    
+  }
 }
 
 static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
   s_hand_sequence = 0;
   
-  if(!s_sending) {
-    begin_sending_data();
-  } else {
+  if(app_worker_is_running()) {
     stop_sending_data();
+  } else {
+    begin_sending_data();
   }
 }
 
@@ -159,10 +178,11 @@ static void window_load(Window *window) {
   layer_add_child(window_layer, text_layer_get_layer(s_text_layer_battery));
   
   change_hand();
-  update_data_sent();
   
   battery_state_service_subscribe(battery_handler);
   battery_handler(battery_state_service_peek()); 
+  
+  app_worker_message_subscribe(worker_message_handler);
   
   registerStartCallback(begin_sending_data);
   registerStopCallback(stop_sending_data);
@@ -171,7 +191,7 @@ static void window_load(Window *window) {
 static void window_unload(Window *window) {
   registerStartCallback(NULL);
   registerStopCallback(NULL);
-  
+    
   battery_state_service_unsubscribe();
   
   text_layer_destroy(s_text_layer_hand);
@@ -183,9 +203,6 @@ static void window_unload(Window *window) {
 }
 
 void main_window_push() {
-  s_sending = false;
-  s_send_counter = 0;
-
   s_window = window_create();
   window_set_click_config_provider(s_window, click_config_provider);
   window_set_window_handlers(s_window, (WindowHandlers) {

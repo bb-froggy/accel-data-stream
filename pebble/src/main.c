@@ -3,7 +3,6 @@
 #include "windows/main_window.h"
 
 static void init() {
-  commlog_init();
   comm_init();
   main_window_push();
 }
